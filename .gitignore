@@ -2,5 +2,5 @@
 *.session
 *.session-journal
 link_cache.json
+owner.json
 __pycache__/
-

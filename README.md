@@ -1,29 +1,34 @@
 # Channel Link Sorter Bot (@Link_sorter_A1_bot)
 
-Logs in to your Telegram account (Telethon, one time only), opens the pinned
-channel **Mega premium**, extracts every Telegram channel/group link, checks
-each one and sends back **only the accessible links**.
+Logs in to your Telegram account with Telethon (phone + OTP, entered through
+the bot chat, one time only), opens the pinned channel **Mega premium**,
+extracts every Telegram channel/group link, checks each one and sends back
+**only the accessible links**.
 
-## Setup
-1. Get `API_ID` and `API_HASH` at https://my.telegram.org → *API development tools*.
-2. Put them in `.env` (the bot token is already filled in).
-3. Install and run:
-   ```powershell
-   pip install -r requirements.txt
-   python bot.py
-   ```
-4. **First run only:** the console asks for your phone number, the login code
-   Telegram sends you and your 2FA password (if set). This is saved in `user.session`,
-   so you won't be asked again.
-5. From the same Telegram account, open t.me/Link_sorter_A1_bot and send `/scan`.
+## Run
+```powershell
+pip install -r requirements.txt
+python bot.py
+```
+No API_ID / API_HASH needed – only the bot token in `.env`.
+
+## Log in (first time only)
+1. Open t.me/Link_sorter_A1_bot and send `/login`.
+2. Send your phone number, e.g. `+919876543210`.
+3. Telegram sends you an OTP. Reply with it **using spaces**, e.g. `1 2 3 4 5`
+   (Telegram cancels the login if the plain code is shared in a chat).
+4. If two-step verification is on, send your password (deleted right away).
+5. Done – the session is saved to `user.session`; restarts don't need OTP.
 
 ## Commands
 | Command | What it does |
 |---|---|
+| `/login` | Log in with phone + OTP |
+| `/logout` | Log out and delete the session |
 | `/scan` | Scan the whole channel |
 | `/scan 500` | Scan only the latest 500 messages |
 | `/scan fresh` | Ignore cached results, re-check every link |
-| `/cancel` | Stop a running scan |
+| `/cancel` | Stop a running scan or login |
 
 ## How "accessible" is decided
 | Link type | Accessible when |
@@ -32,12 +37,10 @@ each one and sends back **only the accessible links**.
 | `t.me/+hash`, `t.me/joinchat/hash` | Invite is valid (not expired/revoked) |
 | `t.me/c/123/45` (private post) | Your account is a member of that chat |
 
-Links to users/bots are skipped. Results go to chat as plain links, plus an
-`accessible_links.txt` file with channel titles.
-
 ## Notes
-- Telegram rate-limits username lookups. If a long wait comes up, the bot stops
-  and shows partial results; checked links are cached in `link_cache.json`, so
-  running `/scan` again carries on from where it stopped.
-- Keep `.env` and `*.session` private: they give full access to your bot/account.
-
+- Whoever logs in first becomes the bot owner. Set `OWNER_ID` in `.env` to lock it to you.
+- Telegram rate-limits username lookups; results are cached in `link_cache.json`
+  so a repeated `/scan` continues where it stopped.
+- Telethon always needs app keys internally; by default the public keys of the
+  open-source Telegram Desktop app are used. You can put your own in `.env`.
+- Keep `.env` and `*.session` private.

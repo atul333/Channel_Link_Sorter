@@ -2,12 +2,15 @@
 Channel Link Sorter bot
 =======================
 
-* Logs in to YOUR Telegram account with Telethon (only once - the session is
-  saved to `user.session`).
+* Logs in to YOUR Telegram account with Telethon via phone + OTP sent
+  through the bot chat (only once - the session is saved to `user.session`).
 * Finds the first pinned channel called "Mega premium" (configurable).
 * Extracts every Telegram channel / group link from its messages
   (plain text, hidden hyperlinks and inline buttons).
 * Checks each link and replies (through the bot) with ONLY the accessible ones.
+
+Login: send /login to the bot -> phone number -> OTP (-> 2FA password).
+The session is saved to user.session, so this is needed only once.
 
 Bot commands (only the account owner can use them):
     /start              - help
@@ -30,18 +33,22 @@ from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors, events, functions, types
+from telethon.tl.types.auth import SentCodeTypeApp
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID") or 0)
-API_HASH = os.getenv("API_HASH", "")
+# No personal API keys needed: Telethon uses the public app credentials of the
+# open-source Telegram Desktop client unless you override them in .env.
+API_ID = int(os.getenv("API_ID") or 2040)
+API_HASH = os.getenv("API_HASH") or "b18441a1ff607e10a989891a5462e627"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-PHONE = os.getenv("PHONE") or None
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Mega premium").strip()
-OWNER_ID = int(os.getenv("OWNER_ID") or 0)          # 0 = the logged-in account
+OWNER_ID = int(os.getenv("OWNER_ID") or 0)          # 0 = whoever logs in first
+OWNER_FILE = "owner.json"
+USER_SESSION = "user"   # -> user.session (created after the OTP login)
 CHECK_DELAY = float(os.getenv("CHECK_DELAY", "2"))   # seconds between checks
 MAX_FLOOD_WAIT = int(os.getenv("MAX_FLOOD_WAIT", "300"))
 CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
@@ -313,64 +320,226 @@ HELP = (
     f"I read the pinned channel <b>{CHANNEL_NAME}</b> from your account, "
     "collect every Telegram channel/group link and send back only the "
     "<b>accessible</b> ones.\n\n"
+    "<b>Account</b>\n"
+    "/login – log in to your Telegram account with OTP (one time)\n"
+    "/logout – log out and delete the saved session\n\n"
+    "<b>Scan</b>\n"
     "/scan – scan whole channel\n"
     "/scan 500 – scan latest 500 messages\n"
     "/scan fresh – ignore cache, re-check everything\n"
-    "/cancel – stop a running scan"
+    "/cancel – stop a running scan / login"
 )
 
 
-async def main():
-    global OWNER_ID
-    if not (API_ID and API_HASH and BOT_TOKEN):
-        raise SystemExit("❌ Fill API_ID, API_HASH and BOT_TOKEN in the .env file.")
+def load_owner() -> int:
+    if OWNER_ID:
+        return OWNER_ID
+    try:
+        with open(OWNER_FILE, "r", encoding="utf-8") as f:
+            return int(json.load(f)["owner_id"])
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
+        return 0
 
-    user = TelegramClient("user", API_ID, API_HASH)
+
+def save_owner(uid: int) -> None:
+    with open(OWNER_FILE, "w", encoding="utf-8") as f:
+        json.dump({"owner_id": uid}, f)
+
+
+def new_user_client() -> TelegramClient:
+    return TelegramClient(USER_SESSION, API_ID, API_HASH)
+
+
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit("❌ Put BOT_TOKEN in the .env file.")
+
+    clients = {"user": new_user_client()}
+    await clients["user"].connect()
+
+    owner = {"id": load_owner()}
+    if await clients["user"].is_user_authorized():
+        me = await clients["user"].get_me()
+        log.info("Using saved session: %s (id=%s)", me.first_name, me.id)
+        if not owner["id"]:
+            owner["id"] = me.id
+            save_owner(me.id)
+    else:
+        log.info("No saved session yet - send /login to the bot to log in with OTP")
+
     bot = TelegramClient("bot", API_ID, API_HASH)
     bot.parse_mode = "html"
-
-    # Interactive only on the very first run (phone, code, 2FA password).
-    await user.start(phone=PHONE)
-    me = await user.get_me()
-    if not OWNER_ID:
-        OWNER_ID = me.id
-    log.info("User account logged in as %s (id=%s)", me.first_name, me.id)
-
     await bot.start(bot_token=BOT_TOKEN)
     bot_me = await bot.get_me()
-    log.info("Bot running as @%s - owner id %s", bot_me.username, OWNER_ID)
+    log.info("Bot running as @%s", bot_me.username)
 
     scan_lock = asyncio.Lock()
     cancel_event = asyncio.Event()
+    login_state: dict[int, dict] = {}   # chat_id -> {"step", "phone", "hash"}
 
     def is_owner(event) -> bool:
-        return event.sender_id == OWNER_ID
+        # Before the first login there is no owner yet (set OWNER_ID to lock it).
+        return owner["id"] == 0 or event.sender_id == owner["id"]
 
+    async def deny(event):
+        await event.reply("⛔ This bot is private.")
+
+    # ---------------- /start ---------------- #
     @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
     async def on_start(event):
         if not is_owner(event):
-            await event.reply("⛔ This bot is private.")
-            return
-        await event.reply(HELP)
+            return await deny(event)
+        if await clients["user"].is_user_authorized():
+            me = await clients["user"].get_me()
+            state = f"🟢 Logged in as <b>{html.escape(me.first_name or '')}</b>"
+        else:
+            state = "🔴 Not logged in – send /login"
+        await event.reply(f"{HELP}\n\n{state}")
 
+    # ---------------- /login ---------------- #
+    @bot.on(events.NewMessage(pattern=r"^/login"))
+    async def on_login(event):
+        if not event.is_private:
+            return await event.reply("Use /login in a private chat with me.")
+        if not is_owner(event):
+            return await deny(event)
+        user = clients["user"]
+        if not user.is_connected():
+            await user.connect()
+        if await user.is_user_authorized():
+            me = await user.get_me()
+            return await event.reply(
+                f"✅ Already logged in as <b>{html.escape(me.first_name or '')}</b>. "
+                "Use /logout first to switch account."
+            )
+        login_state[event.chat_id] = {"step": "phone"}
+        await event.reply(
+            "📱 Send your phone number with country code\n"
+            "e.g. <code>+919876543210</code>\n\n/cancel to abort"
+        )
+
+    async def finish_login(event):
+        login_state.pop(event.chat_id, None)
+        me = await clients["user"].get_me()
+        if not OWNER_ID:
+            owner["id"] = event.sender_id
+            save_owner(event.sender_id)
+        log.info("Logged in as %s (id=%s)", me.first_name, me.id)
+        await event.respond(
+            f"✅ Logged in as <b>{html.escape(me.first_name or '')}</b>.\n"
+            "Session saved – you won't need OTP again.\n\nSend /scan to start."
+        )
+
+    @bot.on(events.NewMessage(
+        func=lambda e: e.is_private and e.chat_id in login_state
+        and not (e.raw_text or "").startswith("/")))
+    async def on_login_step(event):
+        if not is_owner(event):
+            return
+        st = login_state[event.chat_id]
+        text = (event.raw_text or "").strip()
+        user = clients["user"]
+        try:
+            if st["step"] == "phone":
+                phone = re.sub(r"[^\d+]", "", text)
+                if not re.fullmatch(r"\+?\d{7,15}", phone):
+                    return await event.reply("❌ That doesn't look like a phone number. Try again.")
+                phone = phone if phone.startswith("+") else "+" + phone
+                sent = await user.send_code_request(phone)
+                st.update(step="code", phone=phone, hash=sent.phone_code_hash)
+                where = ("your Telegram app" if isinstance(sent.type, SentCodeTypeApp)
+                         else "SMS")
+                await event.reply(
+                    f"📩 OTP sent to {where}.\n\n"
+                    "⚠️ Send it <b>with spaces</b>, e.g. <code>1 2 3 4 5</code>\n"
+                    "(Telegram cancels the login if the plain code is shared in a chat.)"
+                )
+
+            elif st["step"] == "code":
+                code = re.sub(r"\D", "", text)
+                if len(code) < 5:
+                    return await event.reply("❌ Send the full code, e.g. <code>1 2 3 4 5</code>")
+                try:
+                    await event.delete()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await user.sign_in(st["phone"], code, phone_code_hash=st["hash"])
+                except errors.SessionPasswordNeededError:
+                    st["step"] = "password"
+                    return await event.respond(
+                        "🔐 Two-step verification is on. Send your cloud password "
+                        "(the message will be deleted right away)."
+                    )
+                await finish_login(event)
+
+            elif st["step"] == "password":
+                try:
+                    await event.delete()
+                except Exception:  # noqa: BLE001
+                    pass
+                await user.sign_in(password=text)
+                await finish_login(event)
+
+        except errors.PhoneNumberInvalidError:
+            await event.reply("❌ Invalid phone number. Send it again with country code.")
+        except errors.PhoneNumberBannedError:
+            login_state.pop(event.chat_id, None)
+            await event.reply("❌ This phone number is banned by Telegram.")
+        except errors.PhoneCodeInvalidError:
+            await event.respond("❌ Wrong code. Send it again (with spaces).")
+        except errors.PhoneCodeExpiredError:
+            login_state.pop(event.chat_id, None)
+            await event.respond("⌛ Code expired (or was shared without spaces). Send /login again.")
+        except errors.PasswordHashInvalidError:
+            await event.respond("❌ Wrong password. Try again.")
+        except errors.FloodWaitError as e:
+            login_state.pop(event.chat_id, None)
+            await event.respond(f"⏳ Too many attempts. Try again in {e.seconds // 60 + 1} min.")
+        except errors.RPCError as e:
+            login_state.pop(event.chat_id, None)
+            await event.respond(f"❌ Login failed: {e.__class__.__name__}. Send /login to retry.")
+
+    # ---------------- /logout ---------------- #
+    @bot.on(events.NewMessage(pattern=r"^/logout"))
+    async def on_logout(event):
+        if not is_owner(event):
+            return await deny(event)
+        if scan_lock.locked():
+            return await event.reply("⏳ A scan is running. /cancel it first.")
+        user = clients["user"]
+        if await user.is_user_authorized():
+            await user.log_out()           # also deletes user.session
+        clients["user"] = new_user_client()
+        await clients["user"].connect()
+        owner["id"] = OWNER_ID
+        if os.path.exists(OWNER_FILE):
+            os.remove(OWNER_FILE)
+        await event.reply("👋 Logged out and session deleted. Send /login to log in again.")
+
+    # ---------------- /cancel ---------------- #
     @bot.on(events.NewMessage(pattern=r"^/cancel"))
     async def on_cancel(event):
         if not is_owner(event):
             return
-        if scan_lock.locked():
+        if login_state.pop(event.chat_id, None):
+            await event.reply("Login cancelled.")
+        elif scan_lock.locked():
             cancel_event.set()
             await event.reply("🛑 Cancelling…")
         else:
             await event.reply("Nothing is running.")
 
+    # ---------------- /scan ---------------- #
     @bot.on(events.NewMessage(pattern=r"^/scan(?:@\w+)?(.*)$"))
     async def on_scan(event):
         if not is_owner(event):
-            await event.reply("⛔ This bot is private.")
-            return
+            return await deny(event)
+        user = clients["user"]
+        if not await user.is_user_authorized():
+            return await event.reply("🔴 Not logged in. Send /login first.")
         if scan_lock.locked():
-            await event.reply("⏳ A scan is already running. Use /cancel to stop it.")
-            return
+            return await event.reply("⏳ A scan is already running. Use /cancel to stop it.")
 
         args = event.pattern_match.group(1).split()
         limit = next((int(a) for a in args if a.isdigit()), None)
@@ -386,7 +555,8 @@ async def main():
                 log.exception("Scan failed")
                 await progress(f"❌ Scan failed: {type(e).__name__}: {e}", True)
 
-    log.info("Ready. Open your bot in Telegram and send /scan")
+    log.info("Ready. Open @%s in Telegram and send /login (first time) or /scan",
+             bot_me.username)
     await bot.run_until_disconnected()
 
 
