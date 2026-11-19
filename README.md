@@ -1,32 +1,30 @@
 # Channel Link Sorter Bot (@Link_sorter_A1_bot)
 
-Runs using **only the Bot Token** (no user session, no phone/OTP login) and
-extracts **all** Telegram links present in a channel without checking link
-expiration.
+Logs in to your Telegram account with Telethon (via `/login` phone + OTP or
+`/setsession`), opens your first pinned channel **Mega premium**, and extracts
+**all** Telegram links present in the channel without checking link expiration.
 
 ## Features
-- **No User Session / No OTP Login:** Works with `BOT_TOKEN` alone.
-- **No Expiration Checks / No Rate Limits:** Extracts all links immediately.
+- **One-Time Telethon Login:** Log in once via `/login` (phone + OTP) or `/setsession <string>`. Saved to `user.session` / `session_string.txt`.
+- **No Expiration Checks / Instant Extraction:** Extracts all links immediately without checking whether links are expired or accessible.
 - **Separates `https://t.me/addlist/` Links:**
-  - **📢 Telegram Channel / Group Links** (`t.me/username`, `t.me/+hash`, `t.me/joinchat/hash`, `t.me/c/...`)
-  - **📁 Addlist / Folder Links** (`https://t.me/addlist/...`) — numbered and delivered in a separate list and separate `.txt` file.
-- **Numbered 5-by-5 Blocks + Separate 5-by-5 Checklists:**
+  - **📢 Telegram Channel / Group Links** (`t.me/username`, `t.me/+hash`, `t.me/joinchat/hash`, `t.me/c/...`) -> sent in 5-by-5 numbered lists + `channel_links.txt`.
+  - **📁 Addlist / Folder Links** (`https://t.me/addlist/...`) -> separated into their own 5-by-5 numbered lists + `addlist_links.txt`.
+- **5-by-5 Grouping & Separate 5-by-5 Checklists:**
   - Links are numbered `1.`, `2.`, `3.`… with a blank line after every 5 links.
   - Each message has separate checklist toggle buttons for every 5-link block (`⬜ 1–5`, `⬜ 6–10`, `⬜ 11–15`, `⬜ 16–20`) plus `✅ Check All`.
 - **No Duplicates / No Repeats:** Duplicate links are removed and previously sent links are stored in `sent_links.json`.
 
-## 3 Ways to Extract Links from a Channel
-1. **Forward Messages Directly:** Select and forward messages from the channel to @Link_sorter_A1_bot (1 message or 100+ at a time).
-2. **Scan Whole Channel Automatically:** Add @Link_sorter_A1_bot as an Admin in the channel, then forward the latest post from that channel to the bot (or send `/scan https://t.me/c/XXXX/YYYY` or `/scan @channelname`). The bot reads all posts (`1..latest`) directly by ID.
-3. **Upload Chat Export File:** Send an exported `.html`, `.json`, or `.txt` file to the bot.
-
 ## Commands
 | Command | Description |
 |---|---|
-| `/start` | Show help and saved channel |
-| `/scan` | Scan saved channel (or `/scan <post_link or @channel>`) |
+| `/login` | Log in to your Telegram account with phone + OTP |
+| `/setsession <string>` | Log in directly using a session string (no OTP needed on cloud servers) |
+| `/session` | Get your session string to use on a cloud server |
+| `/logout` | Log out and delete the saved session |
+| `/scan` | Extract all links from the whole channel (`/scan 500` for latest 500 messages) |
 | `/progress` | Show completed vs pending counts and next link |
 | `/pending` | Resend uncompleted links |
 | `/done 25` | Mark Channel links `1–25` completed (`/done addlist 10` for Addlist links) |
 | `/resetsent` | Clear sent history and restart numbering at `1` |
-| `/cancel` | Stop a running scan |
+| `/cancel` | Stop a running scan or login |
