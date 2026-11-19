@@ -29,6 +29,16 @@ No API_ID / API_HASH needed – only the bot token in `.env`.
 | `/scan 500` | Scan only the latest 500 messages |
 | `/scan fresh` | Ignore cached results, re-check every link |
 | `/cancel` | Stop a running scan or login |
+| `/resetsent` | Forget already-sent links and restart numbering at 1 |
+| `/done 25` | Mark work completed till link #25 (or tap **☑️ Till N** under a list) |
+| `/progress` | Show where you stopped and the next link |
+| `/pending` | Resend links not yet marked completed |
+
+**Numbered lists:** links are sent as `1.`, `2.`, `3.`… (numbering continues across scans), 20 per message with a gap after every 5. Completed links get a ✅.
+
+**Rate limits:** when Telegram rate-limits the account, the bot sends the links found so far, waits the required time (with a countdown), then resumes automatically until the whole channel is checked.
+
+**No repeats:** duplicate links (and different links to the same channel) are sent only once, and links already sent to you in earlier scans are skipped. History is kept in `sent_links.json`.
 
 ## How "accessible" is decided
 | Link type | Accessible when |

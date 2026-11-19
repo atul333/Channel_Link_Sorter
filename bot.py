@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, errors, events, functions, types
+from telethon import Button, TelegramClient, errors, events, functions, types
 from telethon.tl.types.auth import SentCodeTypeApp
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +55,7 @@ CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
 INCLUDE_MENTIONS = os.getenv("INCLUDE_MENTIONS", "false").lower() == "true"
 
 CACHE_FILE = "link_cache.json"
+SENT_FILE = "sent_links.json"   # links already delivered to the admin
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO
@@ -211,22 +212,22 @@ async def check_username(client, username, notify):
             client, functions.contacts.ResolveUsernameRequest(username), notify
         )
     except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
-        return False, "username not found"
+        return False, "username not found", None
     except errors.ChannelPrivateError:
-        return False, "private / banned"
+        return False, "private / banned", None
 
     peer = res.peer
     if isinstance(peer, types.PeerUser):
-        return None, "user or bot (not a channel)"
+        return None, "user or bot (not a channel)", None
 
     chat = next((c for c in res.chats if c.id == getattr(peer, "channel_id",
                  getattr(peer, "chat_id", None))), None)
     if chat is None or isinstance(chat, (types.ChannelForbidden, types.ChatForbidden)):
-        return False, "forbidden"
+        return False, "forbidden", None
     if _blocked_everywhere(chat):
-        return False, "blocked by Telegram"
+        return False, "blocked by Telegram", None
     kind = "channel" if getattr(chat, "broadcast", False) else "group"
-    return True, f"{kind}: {chat.title}"
+    return True, f"{kind}: {chat.title}", str(chat.id)
 
 
 async def check_invite(client, invite_hash, notify):
@@ -236,18 +237,18 @@ async def check_invite(client, invite_hash, notify):
         )
     except (errors.InviteHashExpiredError, errors.InviteHashInvalidError,
             errors.InviteHashEmptyError):
-        return False, "invite expired / invalid"
+        return False, "invite expired / invalid", None
 
     if isinstance(res, (types.ChatInviteAlready, types.ChatInvitePeek)):
         chat = res.chat
         if isinstance(chat, (types.ChannelForbidden, types.ChatForbidden)):
-            return False, "forbidden"
-        return True, f"already joined: {chat.title}"
+            return False, "forbidden", None
+        return True, f"already joined: {chat.title}", str(chat.id)
     if isinstance(res, types.ChatInvite):
         extra = " (join request needed)" if getattr(res, "request_needed", False) else ""
         kind = "channel" if res.broadcast else "group"
-        return True, f"{kind}: {res.title}{extra}"
-    return False, "unknown invite type"
+        return True, f"{kind}: {res.title}{extra}", None
+    return False, "unknown invite type", None
 
 
 # --------------------------------------------------------------------------- #
@@ -259,6 +260,119 @@ def load_cache() -> dict:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+LINKS_PER_MESSAGE = 20   # links per bot message (gap after every 5)
+
+# In-memory history of delivered links (persisted to SENT_FILE):
+#   keys / chats  -> what was already sent (never send again)
+#   counter       -> last serial number given to a link (1, 2, 3 ...)
+#   done_till     -> admin marked "work completed till #N"
+#   items         -> [{"n": 1, "url": "...", "info": "..."}, ...]
+STATE: dict = {}
+
+
+def load_sent() -> dict:
+    try:
+        with open(SENT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    STATE.clear()
+    STATE.update(
+        keys=set(data.get("keys", [])),
+        chats=set(data.get("chats", [])),
+        counter=int(data.get("counter", 0)),
+        done_till=int(data.get("done_till", 0)),
+        items=list(data.get("items", [])),
+    )
+    return STATE
+
+
+def save_sent() -> None:
+    with open(SENT_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "counter": STATE["counter"],
+            "done_till": STATE["done_till"],
+            "items": STATE["items"],
+            "keys": sorted(STATE["keys"]),
+            "chats": sorted(STATE["chats"]),
+        }, f, ensure_ascii=False, indent=1)
+
+
+def format_items(items: list[dict]) -> str:
+    """1. link / 2. link ... with an empty line after every 5 links.
+    Links up to the admin's "done" mark get a ✅."""
+    done = STATE["done_till"]
+    lines = []
+    for i, it in enumerate(items):
+        n = it["n"]
+        if i and n % 5 == 1:
+            lines.append("")
+        mark = "✅ " if n <= done else ""
+        lines.append(f"{mark}<b>{n}.</b> {html.escape(it['url'])}")
+    return "\n".join(lines)
+
+
+def item_buttons(items: list[dict]):
+    """One button per block of 5: tap to mark work completed till that link."""
+    first, last = items[0]["n"], items[-1]["n"]
+    done = STATE["done_till"]
+    btns = []
+    for it in items:
+        n = it["n"]
+        if n % 5 == 0 or n == last:
+            label = f"✅ Till {n}" if n <= done else f"☑️ Till {n}"
+            btns.append(Button.inline(label, f"done:{n}:{first}:{last}".encode()))
+    return [btns[i:i + 4] for i in range(0, len(btns), 4)]
+
+
+async def send_items(bot, chat_id, items: list[dict]) -> None:
+    for i in range(0, len(items), LINKS_PER_MESSAGE):
+        part = items[i:i + LINKS_PER_MESSAGE]
+        await bot.send_message(chat_id, format_items(part),
+                               buttons=item_buttons(part), link_preview=False)
+        await asyncio.sleep(1)
+
+
+async def deliver(bot, chat_id, found: list) -> list[dict]:
+    """Number + send new accessible links, skipping anything already sent."""
+    items = []
+    for link, info, cid in found:
+        if link.key in STATE["keys"] or (cid and cid in STATE["chats"]):
+            continue
+        STATE["counter"] += 1
+        it = {"n": STATE["counter"], "url": link.url, "info": info}
+        STATE["items"].append(it)
+        STATE["keys"].add(link.key)
+        if cid:
+            STATE["chats"].add(cid)
+        items.append(it)
+    if items:
+        save_sent()
+        await send_items(bot, chat_id, items)
+    return items
+
+
+def fmt_dur(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m}m" if h else (f"{m}m {s}s" if m else f"{s}s")
+
+
+async def wait_out(seconds: float, cancel_event, progress, text: str) -> bool:
+    """Sleep through a rate limit (showing a countdown). False if cancelled."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        if cancel_event.is_set():
+            return False
+        await progress(f"{text}\n\n⏳ Auto-resume in {fmt_dur(left)}  (/cancel to stop)", True)
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=min(30, left))
+        except asyncio.TimeoutError:
+            pass
+    return not cancel_event.is_set()
 
 
 def save_cache(cache: dict) -> None:
@@ -327,7 +441,13 @@ HELP = (
     "/scan – scan whole channel\n"
     "/scan 500 – scan latest 500 messages\n"
     "/scan fresh – ignore cache, re-check everything\n"
-    "/cancel – stop a running scan / login"
+    "/cancel – stop a running scan / login\n"
+    "/resetsent – forget already-sent links\n\n"
+    "<b>Progress</b>\n"
+    "Tap <b>☑️ Till N</b> under a list, or /done 25 – mark completed till link #25\n"
+    "/progress – where you stopped\n"
+    "/pending – resend links not yet completed\n\n"
+    "ℹ️ Duplicate links and links already sent to you are never sent again."
 )
 
 
@@ -375,6 +495,7 @@ async def main():
 
     scan_lock = asyncio.Lock()
     cancel_event = asyncio.Event()
+    load_sent()
     login_state: dict[int, dict] = {}   # chat_id -> {"step", "phone", "hash"}
 
     def is_owner(event) -> bool:
@@ -530,6 +651,74 @@ async def main():
         else:
             await event.reply("Nothing is running.")
 
+    # ---------------- /resetsent ---------------- #
+    @bot.on(events.NewMessage(pattern=r"^/resetsent"))
+    async def on_resetsent(event):
+        if not is_owner(event):
+            return await deny(event)
+        if scan_lock.locked():
+            return await event.reply("⏳ A scan is running. /cancel it first.")
+        n = STATE["counter"]
+        if os.path.exists(SENT_FILE):
+            os.remove(SENT_FILE)
+        load_sent()
+        await event.reply(f"🗑 Sent history cleared ({n} links). "
+                          "Numbering restarts at 1 and the next /scan sends everything again.")
+
+    # ---------------- progress marking ---------------- #
+    def progress_text() -> str:
+        done, total = STATE["done_till"], STATE["counter"]
+        text = (f"📌 Completed till <b>#{done}</b> of {total} links\n"
+                f"⏳ Pending: {max(0, total - done)}")
+        nxt = next((it for it in STATE["items"] if it["n"] == done + 1), None)
+        if nxt:
+            text += f"\n➡️ Next: <b>{nxt['n']}.</b> {html.escape(nxt['url'])}"
+        return text
+
+    @bot.on(events.CallbackQuery(pattern=rb"^done:(\d+):(\d+):(\d+)$"))
+    async def on_done_button(event):
+        if not is_owner(event):
+            return await event.answer("⛔ Not allowed", alert=True)
+        n, first, last = (int(x) for x in event.pattern_match.groups())
+        STATE["done_till"] = n
+        save_sent()
+        items = [it for it in STATE["items"] if first <= it["n"] <= last]
+        if items:
+            try:
+                await event.edit(format_items(items), buttons=item_buttons(items),
+                                 link_preview=False)
+            except errors.MessageNotModifiedError:
+                pass
+        await event.answer(f"✅ Marked completed till #{n}")
+
+    @bot.on(events.NewMessage(pattern=r"^/done(?:@\w+)?(?:\s+(\d+))?\s*$"))
+    async def on_done(event):
+        if not is_owner(event):
+            return await deny(event)
+        num = event.pattern_match.group(1)
+        if not num:
+            return await event.reply("Usage: <code>/done 25</code> – marks work completed till link #25")
+        n = min(int(num), STATE["counter"])
+        STATE["done_till"] = n
+        save_sent()
+        await event.reply(progress_text(), link_preview=False)
+
+    @bot.on(events.NewMessage(pattern=r"^/progress"))
+    async def on_progress(event):
+        if not is_owner(event):
+            return await deny(event)
+        await event.reply(progress_text(), link_preview=False)
+
+    @bot.on(events.NewMessage(pattern=r"^/pending"))
+    async def on_pending(event):
+        if not is_owner(event):
+            return await deny(event)
+        items = [it for it in STATE["items"] if it["n"] > STATE["done_till"]]
+        if not items:
+            return await event.reply("🎉 Nothing pending – all sent links are marked completed.")
+        await event.reply(f"⏳ {len(items)} pending links (after #{STATE['done_till']}):")
+        await send_items(bot, event.chat_id, items)
+
     # ---------------- /scan ---------------- #
     @bot.on(events.NewMessage(pattern=r"^/scan(?:@\w+)?(.*)$"))
     async def on_scan(event):
@@ -561,6 +750,7 @@ async def main():
 
 
 async def run_scan(user, bot, event, progress, limit, fresh, cancel_event):
+    chat_id = event.chat_id
     dialog = await find_target_channel(user)
     if dialog is None:
         await progress(f"❌ Could not find a pinned channel named “{CHANNEL_NAME}”.", True)
@@ -570,23 +760,35 @@ async def run_scan(user, bot, event, progress, limit, fresh, cancel_event):
     own_username = (getattr(channel, "username", None) or "").lower()
     await progress(f"📥 Reading messages from <b>{name}</b>…", True)
 
-    # ---- 1. Collect links -------------------------------------------------- #
+    # ---- 1. Collect links (resumes after rate limits) ---------------------- #
     links: dict[str, Link] = {}
     scanned = 0
-    async for msg in user.iter_messages(channel, limit=limit):
-        if cancel_event.is_set():
+    offset_id = 0
+    while True:
+        try:
+            remaining = None if limit is None else max(0, limit - scanned)
+            if remaining == 0:
+                break
+            async for msg in user.iter_messages(channel, limit=remaining, offset_id=offset_id):
+                if cancel_event.is_set():
+                    break
+                offset_id = msg.id
+                scanned += 1
+                for raw in extract_raw_links(msg):
+                    link = parse_link(raw)
+                    if not link or link.key in links:
+                        continue
+                    if link.kind == "username" and link.value.lower() == own_username:
+                        continue
+                    links[link.key] = link
+                if scanned % 200 == 0:
+                    await progress(f"📥 {name}: {scanned} messages read, "
+                                   f"{len(links)} unique links found…")
             break
-        scanned += 1
-        for raw in extract_raw_links(msg):
-            link = parse_link(raw)
-            if not link or link.key in links:
-                continue
-            if link.kind == "username" and link.value.lower() == own_username:
-                continue
-            links[link.key] = link
-        if scanned % 200 == 0:
-            await progress(f"📥 {name}: {scanned} messages read, "
-                           f"{len(links)} unique links found…")
+        except errors.FloodWaitError as e:
+            if not await wait_out(e.seconds + 5, cancel_event, progress,
+                                  f"⚠️ Rate limit while reading {name} ({scanned} messages so far)."):
+                break
 
     if cancel_event.is_set():
         await progress("🛑 Scan cancelled.", True)
@@ -595,29 +797,46 @@ async def run_scan(user, bot, event, progress, limit, fresh, cancel_event):
         await progress(f"No Telegram links found in {scanned} messages.", True)
         return
 
-    # ---- 2. Check links ---------------------------------------------------- #
-    cache = load_cache()
-    accessible: list[tuple[Link, str]] = []
-    dead = skipped = 0
-    stop_reason = ""
-    member_chats: dict[str, str] | None = None
-    total = len(links)
+    link_list = list(links.values())[::-1]      # oldest post first
+    total = len(link_list)
 
-    for i, link in enumerate(links.values(), 1):
+    # ---- 2. Check links; send in numbered batches as they are found -------- #
+    cache = load_cache()
+    pending: list = []                 # accessible, not yet sent
+    scan_items: list[dict] = []        # sent during this scan
+    seen_chats: set[str] = set()
+    dead = skipped = already_sent = duplicates = rate_limits = 0
+    member_chats: dict[str, str] | None = None
+    cancelled = False
+
+    async def flush():
+        nonlocal pending
+        if pending:
+            scan_items.extend(await deliver(bot, chat_id, pending))
+            pending = []
+
+    i = 0
+    while i < total:
         if cancel_event.is_set():
-            stop_reason = "🛑 Cancelled by user - partial results below."
+            cancelled = True
             break
+        link = link_list[i]
+
+        if link.key in STATE["keys"]:          # sent in an earlier scan
+            already_sent += 1
+            i += 1
+            continue
 
         cached = cache.get(link.key)
         if (cached and not fresh and link.kind != "private_id"
                 and time.time() - cached["ts"] < CACHE_HOURS * 3600):
-            ok, info = cached["ok"], cached["info"]
+            ok, info, cid = cached["ok"], cached["info"], cached.get("cid")
         else:
             try:
                 if link.kind == "username":
-                    ok, info = await check_username(user, link.value, progress)
+                    ok, info, cid = await check_username(user, link.value, progress)
                 elif link.kind == "invite":
-                    ok, info = await check_invite(user, link.value, progress)
+                    ok, info, cid = await check_invite(user, link.value, progress)
                 else:  # private t.me/c/<id> link -> accessible only if joined
                     if member_chats is None:
                         member_chats = {
@@ -626,56 +845,91 @@ async def run_scan(user, bot, event, progress, limit, fresh, cancel_event):
                             if d.is_channel or d.is_group
                         }
                     title = member_chats.get(link.value)
+                    cid = link.value
                     ok, info = (True, f"joined: {title}") if title else (False, "private, not joined")
             except errors.FloodWaitError as e:
-                stop_reason = (f"⚠️ Telegram rate limit: must wait {e.seconds // 60} min. "
-                               "Run /scan again later - checked links are cached.")
-                break
+                # Long rate limit: send what we have, wait, then retry this link
+                rate_limits += 1
+                save_cache(cache)
+                await flush()
+                wait = e.seconds + 5
+                resume_at = time.strftime("%I:%M %p", time.localtime(time.time() + wait))
+                await bot.send_message(
+                    chat_id,
+                    f"⚠️ Telegram rate limit at link {i + 1}/{total}.\n"
+                    f"Links found so far are sent above.\n"
+                    f"⏳ Waiting {fmt_dur(wait)} – auto-resume at ~{resume_at}.",
+                )
+                if not await wait_out(wait, cancel_event, progress,
+                                      f"⚠️ Rate limited at link {i + 1}/{total}\n"
+                                      f"✅ {len(scan_items)} sent so far"):
+                    cancelled = True
+                    break
+                await bot.send_message(chat_id, f"▶️ Rate limit over – resuming from link {i + 1}/{total}.")
+                continue                                       # retry same link
             except errors.RPCError as e:
-                ok, info = False, f"error: {e.__class__.__name__}"
+                ok, info, cid = False, f"error: {e.__class__.__name__}", None
 
             if link.kind != "private_id":
-                cache[link.key] = {"ok": ok, "info": info, "ts": time.time()}
+                cache[link.key] = {"ok": ok, "info": info, "cid": cid, "ts": time.time()}
                 if i % 10 == 0:
                     save_cache(cache)
                 await asyncio.sleep(CHECK_DELAY)
 
         if ok is True:
-            accessible.append((link, info))
+            if cid and cid in STATE["chats"]:
+                already_sent += 1          # same channel was sent before via another link
+            elif cid and cid in seen_chats:
+                duplicates += 1            # same channel already found in this scan
+            else:
+                pending.append((link, info, cid))
+                if cid:
+                    seen_chats.add(cid)
+                if len(pending) >= LINKS_PER_MESSAGE:
+                    await flush()
         elif ok is None:
             skipped += 1
         else:
             dead += 1
 
+        i += 1
         await progress(f"🔍 Checking links {i}/{total}\n"
-                       f"✅ {len(accessible)}  ❌ {dead}  ➖ {skipped}")
+                       f"✅ {len(scan_items) + len(pending)} new  ❌ {dead}  "
+                       f"➖ {skipped}  🔁 {already_sent + duplicates}")
 
     save_cache(cache)
+    await flush()
 
     # ---- 3. Report --------------------------------------------------------- #
     summary = (
-        f"📊 <b>{name}</b>\n"
+        f"📊 <b>{name}</b> – {'stopped' if cancelled else 'whole channel checked'}\n"
         f"Messages scanned: {scanned}\n"
-        f"Unique links: {total}\n"
-        f"✅ Accessible: {len(accessible)}\n"
+        f"Unique links: {total} (checked {i})\n"
+        f"✅ New accessible sent: {len(scan_items)}\n"
+        f"🔁 Already sent before: {already_sent}\n"
+        f"♊ Duplicates (same channel): {duplicates}\n"
         f"❌ Not accessible: {dead}\n"
-        f"➖ Users/bots skipped: {skipped}"
+        f"➖ Users/bots skipped: {skipped}\n"
+        f"⏳ Rate limits waited out: {rate_limits}"
     )
-    if stop_reason:
-        summary += f"\n\n{stop_reason}"
+    if cancelled:
+        summary += "\n\n🛑 Cancelled – run /scan again to continue (sent links won't repeat)."
     await progress(summary, True)
 
-    if not accessible:
-        await bot.send_message(event.chat_id, "No accessible links found.")
+    if not scan_items:
+        await bot.send_message(chat_id, "No new accessible links "
+                               "(everything was already sent before).")
         return
 
-    for chunk in chunk_lines([l.url for l, _ in accessible]):
-        await bot.send_message(event.chat_id, chunk, link_preview=False)
-
-    report = "\n".join(f"{l.url}  |  {info}" for l, info in accessible)
+    report = "\n".join(f"{it['n']}. {it['url']}  |  {it['info']}" for it in scan_items)
     f = io.BytesIO(report.encode("utf-8"))
     f.name = "accessible_links.txt"
-    await bot.send_file(event.chat_id, f, caption=f"✅ {len(accessible)} accessible links")
+    await bot.send_file(
+        chat_id, f,
+        caption=(f"✅ {len(scan_items)} new accessible links "
+                 f"(#{scan_items[0]['n']}–#{scan_items[-1]['n']})\n"
+                 "Tap ☑️ Till N under the lists or send /done N to mark your progress."),
+    )
 
 
 if __name__ == "__main__":

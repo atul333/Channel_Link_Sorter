@@ -4,3 +4,4 @@
 link_cache.json
 owner.json
 __pycache__/
+sent_links.json
