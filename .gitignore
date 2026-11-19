@@ -1,5 +1,8 @@
 .env
+*.session
+*.session-journal
 link_cache.json
-
-__pycache__/
+owner.json
 sent_links.json
+target_channel.json
+__pycache__/

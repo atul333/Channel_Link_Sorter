@@ -1,56 +1,32 @@
 # Channel Link Sorter Bot (@Link_sorter_A1_bot)
 
-Logs in to your Telegram account with Telethon (phone + OTP, entered through
-the bot chat, one time only), opens the pinned channel **Mega premium**,
-extracts every Telegram channel/group link, checks each one and sends back
-**only the accessible links**.
+Runs using **only the Bot Token** (no user session, no phone/OTP login) and
+extracts **all** Telegram links present in a channel without checking link
+expiration.
 
-## Run
-```powershell
-pip install -r requirements.txt
-python bot.py
-```
-No API_ID / API_HASH needed – only the bot token in `.env`.
+## Features
+- **No User Session / No OTP Login:** Works with `BOT_TOKEN` alone.
+- **No Expiration Checks / No Rate Limits:** Extracts all links immediately.
+- **Separates `https://t.me/addlist/` Links:**
+  - **📢 Telegram Channel / Group Links** (`t.me/username`, `t.me/+hash`, `t.me/joinchat/hash`, `t.me/c/...`)
+  - **📁 Addlist / Folder Links** (`https://t.me/addlist/...`) — numbered and delivered in a separate list and separate `.txt` file.
+- **Numbered 5-by-5 Blocks + Separate 5-by-5 Checklists:**
+  - Links are numbered `1.`, `2.`, `3.`… with a blank line after every 5 links.
+  - Each message has separate checklist toggle buttons for every 5-link block (`⬜ 1–5`, `⬜ 6–10`, `⬜ 11–15`, `⬜ 16–20`) plus `✅ Check All`.
+- **No Duplicates / No Repeats:** Duplicate links are removed and previously sent links are stored in `sent_links.json`.
 
-## Log in (first time only)
-1. Open t.me/Link_sorter_A1_bot and send `/login`.
-2. Send your phone number, e.g. `+919876543210`.
-3. Telegram sends you an OTP. Reply with it **using spaces**, e.g. `1 2 3 4 5`
-   (Telegram cancels the login if the plain code is shared in a chat).
-4. If two-step verification is on, send your password (deleted right away).
-5. Done – the session is saved to `user.session`; restarts don't need OTP.
+## 3 Ways to Extract Links from a Channel
+1. **Forward Messages Directly:** Select and forward messages from the channel to @Link_sorter_A1_bot (1 message or 100+ at a time).
+2. **Scan Whole Channel Automatically:** Add @Link_sorter_A1_bot as an Admin in the channel, then forward the latest post from that channel to the bot (or send `/scan https://t.me/c/XXXX/YYYY` or `/scan @channelname`). The bot reads all posts (`1..latest`) directly by ID.
+3. **Upload Chat Export File:** Send an exported `.html`, `.json`, or `.txt` file to the bot.
 
 ## Commands
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/login` | Log in with phone + OTP |
-| `/logout` | Log out and delete the session |
-| `/scan` | Scan the whole channel |
-| `/scan 500` | Scan only the latest 500 messages |
-| `/scan fresh` | Ignore cached results, re-check every link |
-| `/cancel` | Stop a running scan or login |
-| `/resetsent` | Forget already-sent links and restart numbering at 1 |
-| `/done 25` | Mark work completed till link #25 (or tap **☑️ Till N** under a list) |
-| `/progress` | Show where you stopped and the next link |
-| `/pending` | Resend links not yet marked completed |
-
-**Numbered lists:** links are sent as `1.`, `2.`, `3.`… (numbering continues across scans), 20 per message with a gap after every 5. Completed links get a ✅.
-
-**Rate limits:** when Telegram rate-limits the account, the bot sends the links found so far, waits the required time (with a countdown), then resumes automatically until the whole channel is checked.
-
-**No repeats:** duplicate links (and different links to the same channel) are sent only once, and links already sent to you in earlier scans are skipped. History is kept in `sent_links.json`.
-
-## How "accessible" is decided
-| Link type | Accessible when |
-|---|---|
-| `t.me/username` | Username exists, is a channel/group, not banned/blocked |
-| `t.me/+hash`, `t.me/joinchat/hash` | Invite is valid (not expired/revoked) |
-| `t.me/c/123/45` (private post) | Your account is a member of that chat |
-
-## Notes
-- Whoever logs in first becomes the bot owner. Set `OWNER_ID` in `.env` to lock it to you.
-- Telegram rate-limits username lookups; results are cached in `link_cache.json`
-  so a repeated `/scan` continues where it stopped.
-- Telethon always needs app keys internally; by default the public keys of the
-  open-source Telegram Desktop app are used. You can put your own in `.env`.
-- Keep `.env` and `*.session` private.
+| `/start` | Show help and saved channel |
+| `/scan` | Scan saved channel (or `/scan <post_link or @channel>`) |
+| `/progress` | Show completed vs pending counts and next link |
+| `/pending` | Resend uncompleted links |
+| `/done 25` | Mark Channel links `1–25` completed (`/done addlist 10` for Addlist links) |
+| `/resetsent` | Clear sent history and restart numbering at `1` |
+| `/cancel` | Stop a running scan |
