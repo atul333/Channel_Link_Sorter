@@ -33,29 +33,37 @@ from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, errors, events, functions, types
+from telethon.sessions import StringSession
 from telethon.tl.types.auth import SentCodeTypeApp
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 load_dotenv()
+
+DATA_DIR = os.path.abspath(os.getenv("DATA_DIR") or BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # No personal API keys needed: Telethon uses the public app credentials of the
 # open-source Telegram Desktop client unless you override them in .env.
 API_ID = int(os.getenv("API_ID") or 2040)
 API_HASH = os.getenv("API_HASH") or "b18441a1ff607e10a989891a5462e627"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Mega premium").strip()
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)          # 0 = whoever logs in first
-OWNER_FILE = "owner.json"
-USER_SESSION = "user"   # -> user.session (created after the OTP login)
+OWNER_FILE = os.path.join(DATA_DIR, "owner.json")
+USER_SESSION = os.path.join(DATA_DIR, "user")        # -> user.session
+BOT_SESSION = os.path.join(DATA_DIR, "bot")          # -> bot.session
 CHECK_DELAY = float(os.getenv("CHECK_DELAY", "2"))   # seconds between checks
 MAX_FLOOD_WAIT = int(os.getenv("MAX_FLOOD_WAIT", "300"))
 CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
 INCLUDE_MENTIONS = os.getenv("INCLUDE_MENTIONS", "false").lower() == "true"
 
-CACHE_FILE = "link_cache.json"
-SENT_FILE = "sent_links.json"   # links already delivered to the admin
+CACHE_FILE = os.path.join(DATA_DIR, "link_cache.json")
+SENT_FILE = os.path.join(DATA_DIR, "sent_links.json")   # links already delivered to the admin
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO
@@ -436,6 +444,7 @@ HELP = (
     "<b>accessible</b> ones.\n\n"
     "<b>Account</b>\n"
     "/login – log in to your Telegram account with OTP (one time)\n"
+    "/session – get SESSION_STRING for cloud servers (survives redeploys)\n"
     "/logout – log out and delete the saved session\n\n"
     "<b>Scan</b>\n"
     "/scan – scan whole channel\n"
@@ -466,8 +475,35 @@ def save_owner(uid: int) -> None:
         json.dump({"owner_id": uid}, f)
 
 
-def new_user_client() -> TelegramClient:
-    return TelegramClient(USER_SESSION, API_ID, API_HASH)
+def find_user_session():
+    """Return StringSession if SESSION_STRING is set, otherwise locate the
+    existing *.session file (user.session or any non-bot .session file)."""
+    if SESSION_STRING:
+        log.info("Loading session from SESSION_STRING environment variable")
+        return StringSession(SESSION_STRING)
+    default_file = USER_SESSION + ".session"
+    if os.path.exists(default_file):
+        log.info("Loading session file: %s", default_file)
+        return USER_SESSION
+    for folder in dict.fromkeys([DATA_DIR, BASE_DIR, os.getcwd()]):
+        try:
+            for fname in sorted(os.listdir(folder)):
+                if fname.endswith(".session") and fname != "bot.session":
+                    full = os.path.join(folder, fname)
+                    if os.path.getsize(full) > 0:
+                        log.info("Found existing session file: %s", full)
+                        return full[:-8]
+        except OSError:
+            pass
+    return USER_SESSION
+
+
+def new_user_client(fresh_file: bool = False) -> TelegramClient:
+    sess = USER_SESSION if fresh_file else find_user_session()
+    return TelegramClient(
+        sess, API_ID, API_HASH,
+        connection_retries=None, retry_delay=5, auto_reconnect=True,
+    )
 
 
 async def main():
@@ -487,7 +523,10 @@ async def main():
     else:
         log.info("No saved session yet - send /login to the bot to log in with OTP")
 
-    bot = TelegramClient("bot", API_ID, API_HASH)
+    bot = TelegramClient(
+        BOT_SESSION, API_ID, API_HASH,
+        connection_retries=None, retry_delay=5, auto_reconnect=True,
+    )
     bot.parse_mode = "html"
     await bot.start(bot_token=BOT_TOKEN)
     bot_me = await bot.get_me()
@@ -545,10 +584,33 @@ async def main():
         if not OWNER_ID:
             owner["id"] = event.sender_id
             save_owner(event.sender_id)
+        s_str = StringSession.save(clients["user"].session)
         log.info("Logged in as %s (id=%s)", me.first_name, me.id)
         await event.respond(
             f"✅ Logged in as <b>{html.escape(me.first_name or '')}</b>.\n"
-            "Session saved – you won't need OTP again.\n\nSend /scan to start."
+            "Session saved to disk – you won't need OTP again.\n\n"
+            "☁️ <b>Running on a cloud server (Render/Railway/Docker)?</b>\n"
+            "Add this to your server environment variables so redeploys never wipe your login:\n"
+            f"<code>SESSION_STRING={html.escape(s_str)}</code>\n\n"
+            "Send /scan to start."
+        )
+
+    # ---------------- /session ---------------- #
+    @bot.on(events.NewMessage(pattern=r"^/session"))
+    async def on_session(event):
+        if not event.is_private:
+            return await event.reply("Use /session in a private chat with me.")
+        if not is_owner(event):
+            return await deny(event)
+        user = clients["user"]
+        if not await user.is_user_authorized():
+            return await event.reply("🔴 Not logged in. Send /login first.")
+        s_str = StringSession.save(user.session)
+        await event.reply(
+            "🔑 <b>Your Telethon SESSION_STRING</b>\n"
+            "Add this to your server's environment variables (or <code>.env</code>) "
+            "so the session never resets on redeploy/restart:\n\n"
+            f"<code>SESSION_STRING={html.escape(s_str)}</code>"
         )
 
     @bot.on(events.NewMessage(
@@ -631,7 +693,7 @@ async def main():
         user = clients["user"]
         if await user.is_user_authorized():
             await user.log_out()           # also deletes user.session
-        clients["user"] = new_user_client()
+        clients["user"] = new_user_client(fresh_file=True)
         await clients["user"].connect()
         owner["id"] = OWNER_ID
         if os.path.exists(OWNER_FILE):
