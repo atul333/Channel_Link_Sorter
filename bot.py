@@ -6,13 +6,15 @@ Channel Link Sorter Bot
   the bot chat (saved to `user.session` / `session_string.txt` so it is needed
   only once).
 * Finds the first pinned channel called "Mega premium" (configurable).
-* Extracts ALL Telegram links present in the channel WITHOUT checking whether
-  links are expired or not (fast, no rate-limit waits).
-* Separates regular channel/group links from folder links starting with
-  `https://t.me/addlist/`.
+* Extracts all Telegram links from the channel:
+  1. Validates Channel / Group links using the `/checklinks` validation logic
+     from "Channel link provider" (HTTP web-preview + `?embed=1` ToS ban check)
+     and sends ONLY the working links.
+  2. Separately extracts and sends ALL `https://t.me/addlist/` folder links.
 * Deduplicates links and never repeats links already sent to the admin.
 * Numbers every link (1., 2., 3.…) separated into 5-by-5 blocks, with a
   separate interactive checklist button for each 5-link block (1–5, 6–10, …).
+* Also supports `/checklinks` to validate any pasted/forwarded links on demand.
 """
 
 import asyncio
@@ -24,8 +26,10 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, errors, events, types
 from telethon.sessions import StringSession
@@ -41,13 +45,14 @@ load_dotenv()
 DATA_DIR = os.path.abspath(os.getenv("DATA_DIR") or BASE_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Public app credentials of the open-source Telegram Desktop client (override in .env if desired)
 API_ID = int(os.getenv("API_ID") or 2040)
 API_HASH = os.getenv("API_HASH") or "b18441a1ff607e10a989891a5462e627"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Mega premium").strip()
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)          # 0 = whoever logs in first
+CHECK_DELAY = float(os.getenv("CHECK_DELAY", "0.35"))
+CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
 INCLUDE_MENTIONS = os.getenv("INCLUDE_MENTIONS", "false").lower() == "true"
 
 USER_SESSION = os.path.join(DATA_DIR, "user")        # -> user.session
@@ -55,13 +60,244 @@ BOT_SESSION = os.path.join(DATA_DIR, "bot")          # -> bot.session
 SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 OWNER_FILE = os.path.join(DATA_DIR, "owner.json")
 SENT_FILE = os.path.join(DATA_DIR, "sent_links.json")
+CACHE_FILE = os.path.join(DATA_DIR, "link_cache.json")
 
 LINKS_PER_MESSAGE = 20   # 4 blocks of 5 links per message
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("link_sorter")
+
+# Shared persistent AsyncClient for link health checks (from Channel link provider)
+_ASYNC_HTTP_CLIENT = httpx.AsyncClient(
+    timeout=httpx.Timeout(12.0, connect=5.0),
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+    },
+)
+
+# --------------------------------------------------------------------------- #
+# Link Validation Logic (from "Channel link provider" /checklinks)
+# --------------------------------------------------------------------------- #
+_GENERIC_TG_PAGE_TITLES = {
+    "not available",
+    "unavailable",
+    "join group chat on telegram",
+    "telegram",
+    "channel not found",
+    "group not found",
+}
+
+
+def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = False) -> str:
+    """
+    Detect Telegram Terms of Service bans, copyright/law blocks, and unavailable notices
+    after unescaping HTML entities (e.g. &#39;, &rsquo;) and normalizing apostrophes.
+    Returns a human-readable dead reason string, or '' if no ban notice is detected.
+    """
+    if not raw_html:
+        return ""
+    unescaped = html.unescape(raw_html)
+    norm = re.sub(r"[\u2018\u2019`´]", "'", unescaped)
+    norm = re.sub(r"\s+", " ", norm).lower()
+
+    # 1. Hard Terms of Service / permanent bans (always dead on any surface)
+    if (
+        "violated telegram's terms of service" in norm
+        or "violated telegrams terms of service" in norm
+        or "violated telegram" in norm
+        or (
+            "terms of service" in norm
+            and any(k in norm for k in ("can't be displayed", "cannot be displayed", "not available", "violated", "blocked"))
+        )
+    ):
+        return "Not available: Violated Telegram's Terms of Service"
+
+    if "copyright infringement" in norm or "violated copyright" in norm:
+        return "Not available: Blocked for copyright infringement"
+
+    if "violated local laws" in norm or "unavailable in your country" in norm or "restricted in your region" in norm:
+        return "Not available: Blocked due to local laws"
+
+    if "because it was blocked" in norm or "channel has been blocked" in norm or "group has been blocked" in norm:
+        return "Channel is blocked/banned by Telegram"
+
+    if any(
+        phrase in norm
+        for phrase in (
+            "channel is inaccessible",
+            "group is inaccessible",
+            "chat is inaccessible",
+            "channel is unavailable",
+            "chat is unavailable",
+            "this channel is not available",
+            "this chat is not available",
+            "this group is not available",
+        )
+    ):
+        return "Channel is not available / inaccessible"
+
+    # 2. Generic "can't be displayed" notices
+    if any(
+        phrase in norm
+        for phrase in (
+            "this channel can't be displayed",
+            "this group can't be displayed",
+            "this chat can't be displayed",
+            "cannot be displayed",
+        )
+    ):
+        # On public ?embed=1 widgets, Telegram shows a web-only NSFW preview notice for live adult channels.
+        # Only skip that notice when allow_web_porn_notice=True and no hard ban phrase matched above.
+        if allow_web_porn_notice and "spread pornographic content" in norm:
+            return ""
+        return "Not available: Channel can't be displayed (Banned/Restricted)"
+
+    return ""
+
+
+async def check_channel_link_alive(link: str) -> tuple[bool, str]:
+    """
+    Check if a Telegram channel link is active and valid (exact /checklinks logic
+    from Channel link provider).
+    Detects expired/revoked links, deleted channels, and Terms of Service bans.
+    Returns (is_alive: bool, detail_or_reason: str).
+    """
+    clean_link = (link or "").strip()
+    if not clean_link:
+        return False, "Empty channel link"
+
+    if clean_link.startswith("@"):
+        clean_link = f"https://t.me/{clean_link.lstrip('@')}"
+    elif not clean_link.startswith(("http://", "https://")):
+        if clean_link.lower().startswith(("t.me/", "telegram.me/")):
+            clean_link = f"https://t.me/{clean_link.split('/', 1)[1]}"
+        else:
+            clean_link = f"https://t.me/{clean_link.lstrip('@')}"
+    else:
+        clean_link = re.sub(
+            r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/",
+            "https://t.me/",
+            clean_link,
+            flags=re.IGNORECASE,
+        )
+    # Normalize preview URLs like https://t.me/s/username -> https://t.me/username
+    clean_link = re.sub(
+        r"^https://t\.me/s/([A-Za-z0-9_]{4,})(?:[/?].*)?$",
+        r"https://t.me/\1",
+        clean_link,
+        flags=re.IGNORECASE,
+    )
+
+    is_invite = "/+" in clean_link or "joinchat/" in clean_link.lower()
+    public_slug = ""
+    if not is_invite and "t.me/" in clean_link:
+        tail = clean_link.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        first_seg = tail.split("/", 1)[0].strip()
+        if first_seg and not first_seg.startswith("+") and first_seg.lower() not in (
+            "c", "s", "addlist", "joinchat", "proxy", "socks"
+        ):
+            public_slug = first_seg.lstrip("@")
+            clean_link = f"https://t.me/{public_slug}"
+
+    # For public channels, check Telegram's ?embed=1 widget endpoint FIRST because it explicitly
+    # returns "This channel can't be displayed because it violated Telegram's Terms of Service."
+    embed_ban_reason = ""
+    if public_slug:
+        try:
+            emb_resp = await _ASYNC_HTTP_CLIENT.get(f"https://t.me/{public_slug}/1?embed=1")
+            if emb_resp.status_code == 200:
+                embed_ban_reason = _detect_telegram_ban_reason(
+                    emb_resp.text, allow_web_porn_notice=True
+                )
+                if embed_ban_reason:
+                    return False, embed_ban_reason
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[LINK CHECK] Embed check skipped for @%s: %s", public_slug, exc)
+
+    # Check the web preview of the link on t.me
+    for attempt in range(2):
+        try:
+            resp = await _ASYNC_HTTP_CLIENT.get(clean_link)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
+                return False, f"Telegram rate limit / server busy (HTTP {resp.status_code})"
+
+            if resp.status_code == 404:
+                return False, "Link not found (HTTP 404)"
+
+            if resp.status_code != 200:
+                return False, f"Unexpected HTTP status {resp.status_code}"
+
+            # If Telegram redirected an invalid username link away from t.me to telegram.org homepage
+            final_host = (resp.url.host or "").lower()
+            if final_host and "telegram.org" in final_host and "t.me" not in final_host:
+                return False, "Invalid or deleted channel (redirected to telegram.org)"
+
+            text = resp.text
+
+            # Check for Terms of Service ban, copyright/law blocks, and unavailable notices
+            ban_reason = _detect_telegram_ban_reason(text, allow_web_porn_notice=False)
+            if ban_reason:
+                return False, ban_reason
+
+            # Extract channel title and subscriber/member count from t.me preview
+            m_title = re.search(
+                r'class=["\']tgme_page_title["\'][^>]*>\s*(?:<span[^>]*>)?(.*?)(?:</span>)?\s*</div>',
+                text,
+                re.S,
+            )
+            title_str = (
+                html.unescape(re.sub(r"<[^>]+>", "", m_title.group(1)).strip())
+                if m_title
+                else ""
+            )
+
+            m_extra = re.search(r'class=["\']tgme_page_extra["\'][^>]*>(.*?)</div>', text, re.S)
+            extra_str = (
+                html.unescape(re.sub(r"<[^>]+>", "", m_extra.group(1)).strip())
+                if m_extra
+                else ""
+            )
+
+            # Reject error / placeholder titles such as "Not available" or "Join group chat on Telegram"
+            if title_str and (
+                title_str.lower() in _GENERIC_TG_PAGE_TITLES
+                or title_str.lower().startswith("telegram: contact @")
+            ):
+                if "not available" in title_str.lower() or "unavailable" in title_str.lower():
+                    return False, "Not available (Channel banned or restricted)"
+                title_str = ""
+
+            if title_str or extra_str:
+                if title_str and extra_str:
+                    return True, f"{title_str} ({extra_str})"
+                if title_str:
+                    return True, title_str
+                return True, f"Active ({extra_str})"
+
+            if is_invite:
+                return False, "Invite link is expired, banned, or invalid"
+            return False, embed_ban_reason or "Channel not available, banned, or not found"
+
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            log.warning("[LINK CHECK] Network exception for %s: %s", clean_link, exc)
+            return False, f"Connection error ({exc})"
+
+    return False, "Could not verify link"
+
 
 # --------------------------------------------------------------------------- #
 # Link extraction / parsing
@@ -83,7 +319,7 @@ RESERVED = {
 
 @dataclass(frozen=True)
 class Link:
-    kind: str    # "username" | "invite" | "private_id" | "addlist"
+    kind: str    # "username" | "invite" | "addlist"
     value: str
     url: str
 
@@ -97,9 +333,9 @@ class Link:
         return f"{self.kind}:{v}"
 
 
-def parse_link(raw: str) -> Link | None:
+def parse_link(raw: str) -> Optional[Link]:
     """Turn a raw link / mention into a normalised Link (or None)."""
-    raw = raw.strip().rstrip(".,;:!?*_~|")
+    raw = raw.strip().rstrip(".,;:!?*_~|)>]}")
     if not raw:
         return None
 
@@ -145,16 +381,6 @@ def parse_link(raw: str) -> Link | None:
     if first.lower() == "joinchat" and len(parts) > 1 and parts[1]:
         return Link("invite", parts[1], f"https://t.me/+{parts[1]}")
 
-    # Private channel post links: t.me/c/<channel_id>/<msg_id>
-    if first.lower() == "c" and len(parts) > 1 and parts[1].isdigit():
-        cid = parts[1]
-        url = (
-            f"https://t.me/c/{cid}/{parts[2]}"
-            if len(parts) > 2 and parts[2].isdigit()
-            else f"https://t.me/c/{cid}"
-        )
-        return Link("private_id", cid, url)
-
     # Preview / boost links: t.me/s/<username>, t.me/boost/<username>
     if first.lower() in {"s", "boost"} and len(parts) > 1:
         first = parts[1]
@@ -164,6 +390,10 @@ def parse_link(raw: str) -> Link | None:
     if USERNAME_RE.match(first):
         return Link("username", first, f"https://t.me/{first}")
     return None
+
+
+def extract_raw_links_from_text(text: str) -> list[str]:
+    return URL_RE.findall(text or "")
 
 
 def extract_raw_links(msg) -> list[str]:
@@ -206,11 +436,11 @@ def extract_raw_links(msg) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Persistent State (Sent Links & 5-by-5 Checklists)
+# Persistent State (Sent Links, Cache & 5-by-5 Checklists)
 # --------------------------------------------------------------------------- #
 # Two separate buckets:
-#   "ch"  -> Regular channel / group links
-#   "al"  -> https://t.me/addlist/... folder links
+#   "ch"  -> Working channel / group links
+#   "al"  -> All https://t.me/addlist/... folder links
 STATE: dict = {}
 
 
@@ -218,8 +448,21 @@ def _empty_bucket() -> dict:
     return {
         "counter": 0,
         "done": set(),   # set of completed link numbers (1, 2, 3...)
-        "items": [],     # [{"n": 1, "url": "..."}]
+        "items": [],     # [{"n": 1, "url": "...", "info": "..."}]
     }
+
+
+def load_cache() -> dict:
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_cache(cache: dict) -> None:
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=1)
 
 
 def load_sent() -> dict:
@@ -239,7 +482,10 @@ def load_sent() -> dict:
             STATE[kind] = {
                 "counter": int(data.get("counter", 0)),
                 "done": set(range(1, done_till + 1)),
-                "items": [{"n": it["n"], "url": it["url"]} for it in data.get("items", [])],
+                "items": [
+                    {"n": it["n"], "url": it["url"], "info": it.get("info", "")}
+                    for it in data.get("items", [])
+                ],
             }
         elif raw_b:
             STATE[kind] = {
@@ -312,7 +558,7 @@ def format_items(kind: str, items: list[dict]) -> str:
     header = (
         "📁 <b>Addlist / Folder Links (https://t.me/addlist/)</b>"
         if kind == "al"
-        else "📢 <b>Telegram Channel / Group Links</b>"
+        else "✅ <b>Working Channel / Group Links</b>"
     )
     lines = [header, ""]
     for i, it in enumerate(items):
@@ -369,41 +615,35 @@ async def send_items(bot, chat_id: int, kind: str, items: list[dict]) -> None:
         await asyncio.sleep(0.8)
 
 
-async def deliver_links(bot, chat_id: int, links: list[Link]) -> tuple[list[dict], list[dict]]:
-    """Assign numbers, persist to sent_links.json, and send Channel links and
-    Addlist links separately in 5-by-5 blocks with checklists."""
-    new_ch: list[dict] = []
-    new_al: list[dict] = []
-
-    for link in links:
+async def deliver_batch(bot, chat_id: int, kind: str,
+                        batch: list[tuple[Link, str]]) -> list[dict]:
+    """Number + persist + send a batch of links of a given kind ('ch' or 'al')."""
+    items: list[dict] = []
+    for link, info in batch:
         if link.key in STATE["keys"]:
             continue
         STATE["keys"].add(link.key)
-        kind = "al" if link.is_addlist else "ch"
         STATE[kind]["counter"] += 1
-        it = {"n": STATE[kind]["counter"], "url": link.url}
+        it = {"n": STATE[kind]["counter"], "url": link.url, "info": info}
         STATE[kind]["items"].append(it)
-        if kind == "al":
-            new_al.append(it)
-        else:
-            new_ch.append(it)
-
-    if new_ch or new_al:
+        items.append(it)
+    if items:
         save_sent()
-    if new_ch:
-        await send_items(bot, chat_id, "ch", new_ch)
-    if new_al:
-        await send_items(bot, chat_id, "al", new_al)
-    return new_ch, new_al
+        await send_items(bot, chat_id, kind, items)
+    return items
 
 
-def make_txt_report(items: list[dict]) -> bytes:
+def make_txt_report(items: list[dict], include_info: bool = True) -> bytes:
     """Format plain text report with 5-by-5 spacing."""
     lines = []
     for i, it in enumerate(items):
         if i > 0 and i % 5 == 0:
             lines.append("")
-        lines.append(f"{it['n']}. {it['url']}")
+        info = it.get("info", "")
+        if include_info and info:
+            lines.append(f"{it['n']}. {it['url']}  |  {info}")
+        else:
+            lines.append(f"{it['n']}. {it['url']}")
     return "\n".join(lines).encode("utf-8")
 
 
@@ -429,20 +669,24 @@ class Progress:
 HELP = (
     "👋 <b>Channel Link Sorter</b>\n\n"
     f"Logs in to your Telegram account once, opens the pinned channel <b>{CHANNEL_NAME}</b>, "
-    "extracts <b>all</b> Telegram links without checking expiration, "
-    "separates <code>https://t.me/addlist/</code> links, and sends them in "
-    "<b>5-by-5</b> numbered lists with <b>5-by-5 checklists</b>.\n\n"
+    "validates every link using the <code>/checklinks</code> logic, sends "
+    "<b>only the working channel links</b>, and separately sends <b>all "
+    "<code>https://t.me/addlist/</code> links</b> in <b>5-by-5</b> numbered lists "
+    "with <b>5-by-5 checklists</b>.\n\n"
     "<b>Account</b>\n"
     "/login – log in with phone + OTP (one time)\n"
     "/setsession &lt;string&gt; – log in directly with a session string (no OTP)\n"
     "/session – get your SESSION_STRING for cloud servers\n"
     "/logout – log out and delete the saved session\n\n"
-    "<b>Scan & Progress</b>\n"
-    "/scan – extract all links from the whole channel\n"
+    "<b>Scan & Validate</b>\n"
+    "/scan – scan whole channel, validate links & send working links + all addlists\n"
     "/scan 500 – scan only the latest 500 messages\n"
+    "/scan fresh – ignore cached link checks and re-validate every link\n"
+    "/checklinks – paste or forward any links to validate and get working links only\n\n"
+    "<b>Progress & History</b>\n"
     "/progress – check completed vs pending counts\n"
     "/pending – resend uncompleted links\n"
-    "/done 25 – mark channel links 1–25 completed (<code>/done addlist 10</code> for addlists)\n"
+    "/done 25 – mark working channel links 1–25 completed (<code>/done addlist 10</code> for addlists)\n"
     "/resetsent – clear history & restart numbering at 1\n"
     "/cancel – stop a running scan / login"
 )
@@ -526,7 +770,8 @@ async def main():
 
     scan_lock = asyncio.Lock()
     cancel_event = asyncio.Event()
-    login_state: dict[int, dict] = {}   # chat_id -> {"step", "phone", "hash"}
+    login_state: dict[int, dict] = {}       # chat_id -> {"step", "phone", "hash"}
+    checklinks_wait: set[int] = set()       # chat_ids waiting for /checklinks input
 
     def is_owner(event) -> bool:
         return owner["id"] == 0 or event.sender_id == owner["id"]
@@ -553,6 +798,7 @@ async def main():
             return await event.reply("Use /login in a private chat with me.")
         if not is_owner(event):
             return await deny(event)
+        checklinks_wait.discard(event.chat_id)
         user = clients["user"]
         if await is_authorized_safe(user):
             me = await user.get_me()
@@ -560,7 +806,6 @@ async def main():
                 f"✅ Already logged in as <b>{html.escape(me.first_name or '')}</b>. "
                 "Use /logout first to switch account."
             )
-        # Ensure a clean client for login
         try:
             await user.disconnect()
         except Exception:  # noqa: BLE001
@@ -594,7 +839,7 @@ async def main():
             "Session saved – you won't need OTP again.\n\n"
             "☁️ <b>For cloud servers (so redeploys never ask for login again):</b>\n"
             f"<code>/setsession {html.escape(s_str)}</code>\n\n"
-            "Send /scan to extract all links from the channel."
+            "Send /scan to validate and extract all working links from the channel."
         )
 
     # ---------------- /setsession ---------------- #
@@ -661,7 +906,6 @@ async def main():
         user = clients["user"]
         try:
             if st["step"] == "phone":
-                # Allow pasting a session string directly at the phone step
                 if len(text) > 100 and not text.startswith("+"):
                     return await apply_session_string(event, text)
                 phone = re.sub(r"[^\d+]", "", text)
@@ -755,11 +999,12 @@ async def main():
     async def on_cancel(event):
         if not is_owner(event):
             return
+        checklinks_wait.discard(event.chat_id)
         if login_state.pop(event.chat_id, None):
             await event.reply("Login cancelled.")
         elif scan_lock.locked():
             cancel_event.set()
-            await event.reply("🛑 Stopping scan…")
+            await event.reply("🛑 Stopping…")
         else:
             await event.reply("Nothing is running.")
 
@@ -775,7 +1020,7 @@ async def main():
             os.remove(SENT_FILE)
         load_sent()
         await event.reply(
-            f"🗑 Cleared history ({ch_n} channel links, {al_n} addlist links).\n"
+            f"🗑 Cleared history ({ch_n} working channel links, {al_n} addlist links).\n"
             "Numbering restarts at 1 and next /scan sends everything again."
         )
 
@@ -817,7 +1062,7 @@ async def main():
     # ---------------- /done, /progress, /pending ---------------- #
     def progress_summary() -> str:
         lines = []
-        for kind, label in (("ch", "📢 Channel/Group Links"), ("al", "📁 Addlist Links")):
+        for kind, label in (("ch", "✅ Working Channel/Group Links"), ("al", "📁 Addlist Links")):
             total = STATE[kind]["counter"]
             done_cnt = len(STATE[kind]["done"])
             pend_cnt = max(0, total - done_cnt)
@@ -868,6 +1113,67 @@ async def main():
         if not any_pending:
             await event.reply("🎉 Nothing pending – all links are marked completed!")
 
+    # ---------------- /checklinks (interactive link validator) ------------- #
+    @bot.on(events.NewMessage(pattern=r"^/(?:checklinks|monitor)(?:@\w+)?(.*)$", func=lambda e: bool(re.match(r"^/(?:checklinks|monitor)", e.raw_text or "", re.I))))
+    async def on_checklinks(event):
+        if not is_owner(event):
+            return await deny(event)
+        if scan_lock.locked():
+            return await event.reply("⏳ A scan is already running. Use /cancel to stop it.")
+
+        raw_links = extract_raw_links(event.message)
+        # Remove the command itself if matched
+        links_map: dict[str, Link] = {}
+        for raw in raw_links:
+            l = parse_link(raw)
+            if l and l.key not in links_map:
+                links_map[l.key] = l
+
+        if not links_map:
+            checklinks_wait.add(event.chat_id)
+            return await event.reply(
+                "🔍 <b>Check Channel Links</b>\n\n"
+                "Send or forward the Telegram links you want to validate.\n"
+                "✅ I will validate them using the <code>/checklinks</code> logic and return:\n"
+                "• <b>Working Channel/Group links only</b> (in 5-by-5 numbered blocks + checklist)\n"
+                "• <b>All <code>https://t.me/addlist/</code> links</b> separately\n\n"
+                "Type /cancel to abort."
+            )
+
+        checklinks_wait.discard(event.chat_id)
+        async with scan_lock:
+            cancel_event.clear()
+            status = await event.reply(f"🔍 Validating {len(links_map)} link(s)…")
+            await validate_and_deliver_links(
+                bot, event.chat_id, "Direct /checklinks", 1,
+                list(links_map.values()), 0, False, Progress(status), cancel_event,
+            )
+
+    @bot.on(events.NewMessage(
+        func=lambda e: e.is_private and e.chat_id in checklinks_wait
+        and e.chat_id not in login_state and not (e.raw_text or "").startswith("/")
+    ))
+    async def on_checklinks_input(event):
+        if not is_owner(event):
+            return
+        links_map: dict[str, Link] = {}
+        for raw in extract_raw_links(event.message):
+            l = parse_link(raw)
+            if l and l.key not in links_map:
+                links_map[l.key] = l
+        if not links_map:
+            return await event.reply(
+                "⚠️ No valid Telegram links found in your message. Send links or /cancel."
+            )
+        checklinks_wait.discard(event.chat_id)
+        async with scan_lock:
+            cancel_event.clear()
+            status = await event.reply(f"🔍 Validating {len(links_map)} link(s)…")
+            await validate_and_deliver_links(
+                bot, event.chat_id, "Direct /checklinks", 1,
+                list(links_map.values()), 0, False, Progress(status), cancel_event,
+            )
+
     # ---------------- /scan ---------------- #
     @bot.on(events.NewMessage(pattern=r"^/scan(?:@\w+)?(.*)$"))
     async def on_scan(event):
@@ -881,13 +1187,14 @@ async def main():
 
         args = event.pattern_match.group(1).split()
         limit = next((int(a) for a in args if a.isdigit()), None)
+        fresh = "fresh" in [a.lower() for a in args]
 
         async with scan_lock:
             cancel_event.clear()
             status = await event.reply("🔎 Looking for the channel…")
             progress = Progress(status)
             try:
-                await run_scan(user, bot, event, progress, limit, cancel_event)
+                await run_scan(user, bot, event, progress, limit, fresh, cancel_event)
             except Exception as e:  # noqa: BLE001
                 log.exception("Scan failed")
                 await progress(f"❌ Scan failed: {type(e).__name__}: {e}", True)
@@ -897,7 +1204,7 @@ async def main():
     await bot.run_until_disconnected()
 
 
-async def run_scan(user, bot, event, progress, limit, cancel_event):
+async def run_scan(user, bot, event, progress, limit, fresh, cancel_event):
     chat_id = event.chat_id
     dialog = await find_target_channel(user)
     if dialog is None:
@@ -906,9 +1213,8 @@ async def run_scan(user, bot, event, progress, limit, cancel_event):
     channel = dialog.entity
     name = html.escape(dialog.name or "channel")
     own_username = (getattr(channel, "username", None) or "").lower()
-    await progress(f"📥 Extracting all links from <b>{name}</b>…", True)
+    await progress(f"📥 Reading messages from <b>{name}</b>…", True)
 
-    # Collect all links from the channel (oldest to newest, no expiration checks)
     links: dict[str, Link] = {}
     already_sent = 0
     scanned = 0
@@ -937,7 +1243,7 @@ async def run_scan(user, bot, event, progress, limit, cancel_event):
                 if scanned % 300 == 0:
                     await progress(
                         f"📥 <b>{name}</b>: {scanned} messages read, "
-                        f"{len(links)} new links found…"
+                        f"{len(links)} new unique links found…"
                     )
             break
         except errors.FloodWaitError as e:
@@ -951,40 +1257,136 @@ async def run_scan(user, bot, event, progress, limit, cancel_event):
         await progress("🛑 Scan cancelled.", True)
         return
 
-    # Reverse so oldest post's links are numbered 1, 2, 3...
+    # Oldest post first
     link_list = list(links.values())[::-1]
-    new_ch, new_al = await deliver_links(bot, chat_id, link_list)
+    await validate_and_deliver_links(
+        bot, chat_id, name, scanned, link_list, already_sent, fresh, progress, cancel_event
+    )
 
+
+async def validate_and_deliver_links(
+    bot,
+    chat_id: int,
+    source_name: str,
+    scanned_msgs: int,
+    link_list: list[Link],
+    already_sent: int,
+    fresh: bool,
+    progress: Progress,
+    cancel_event: asyncio.Event,
+):
+    """
+    1. Separates all `https://t.me/addlist/` links and delivers ALL of them.
+    2. Validates all channel/group links using `check_channel_link_alive` (from
+       Channel link provider's /checklinks) and delivers ONLY the working ones
+       in 5-by-5 numbered blocks with 5-by-5 checklists.
+    """
+    addlist_links = [l for l in link_list if l.is_addlist]
+    channel_links = [l for l in link_list if not l.is_addlist]
+
+    cache = load_cache()
+    working_sent: list[dict] = []
+    pending_ch: list[tuple[Link, str]] = []
+    dead_count = 0
+    dup_channel_count = 0
+    seen_titles: set[str] = set()
+    total_ch = len(channel_links)
+
+    async def flush_ch():
+        nonlocal pending_ch
+        if pending_ch:
+            working_sent.extend(await deliver_batch(bot, chat_id, "ch", pending_ch))
+            pending_ch = []
+
+    for idx, link in enumerate(channel_links, 1):
+        if cancel_event.is_set():
+            break
+        if link.key in STATE["keys"]:
+            already_sent += 1
+            continue
+
+        cached = cache.get(link.key)
+        if cached and not fresh and (time.time() - cached.get("ts", 0) < CACHE_HOURS * 3600):
+            is_alive, detail = bool(cached.get("ok")), str(cached.get("info") or "")
+        else:
+            if idx > 1:
+                await asyncio.sleep(CHECK_DELAY)
+            is_alive, detail = await check_channel_link_alive(link.url)
+            cache[link.key] = {"ok": is_alive, "info": detail, "ts": time.time()}
+            if idx % 20 == 0:
+                save_cache(cache)
+
+        if is_alive:
+            # Also deduplicate two different invite links pointing to the exact same channel title+count
+            norm_detail = detail.strip().casefold() if detail else ""
+            if norm_detail and not norm_detail.startswith("active") and norm_detail in seen_titles:
+                dup_channel_count += 1
+            else:
+                if norm_detail:
+                    seen_titles.add(norm_detail)
+                pending_ch.append((link, detail))
+                if len(pending_ch) >= LINKS_PER_MESSAGE:
+                    await flush_ch()
+        else:
+            dead_count += 1
+
+        await progress(
+            f"🔍 Validating channel links {idx}/{total_ch}\n"
+            f"✅ Working: <b>{len(working_sent) + len(pending_ch)}</b>  |  "
+            f"❌ Expired/Banned: {dead_count}  |  "
+            f"📁 Addlists: {len(addlist_links)}"
+        )
+
+    save_cache(cache)
+    await flush_ch()
+
+    # Deliver ALL https://t.me/addlist/ links separately
+    addlist_sent: list[dict] = []
+    if addlist_links and not cancel_event.is_set():
+        addlist_sent = await deliver_batch(
+            bot, chat_id, "al", [(l, "Addlist Folder") for l in addlist_links]
+        )
+
+    status_tag = "stopped" if cancel_event.is_set() else "validation complete"
     summary = (
-        f"📊 <b>{name}</b> – extraction complete\n"
-        f"Messages scanned: {scanned}\n"
-        f"📢 New Channel/Group links: <b>{len(new_ch)}</b>\n"
-        f"📁 New Addlist (Folder) links: <b>{len(new_al)}</b>\n"
-        f"🔁 Already sent skipped: {already_sent}"
+        f"📊 <b>{source_name}</b> – {status_tag}\n"
+        f"Messages scanned: {scanned_msgs}\n"
+        f"Channel links checked: {total_ch}\n"
+        f"✅ <b>New Working Channel Links: {len(working_sent)}</b>\n"
+        f"❌ Expired / Banned / Invalid: {dead_count}\n"
+        f"♊ Duplicate channels skipped: {dup_channel_count}\n"
+        f"📁 <b>New Addlist (Folder) Links: {len(addlist_sent)}</b>\n"
+        f"🔁 Already sent before: {already_sent}"
     )
     await progress(summary, True)
 
-    if not new_ch and not new_al:
+    if not working_sent and not addlist_sent:
         await bot.send_message(
             chat_id,
-            "No new links found (all links were already sent before, or use /resetsent to resend).",
+            "No new working links or addlist links found (use /resetsent to clear sent history).",
         )
         return
 
-    if new_ch:
-        f = io.BytesIO(make_txt_report(new_ch))
-        f.name = "channel_links.txt"
+    if working_sent:
+        f = io.BytesIO(make_txt_report(working_sent, include_info=True))
+        f.name = "working_channel_links.txt"
         await bot.send_file(
             chat_id, f,
-            caption=f"📢 {len(new_ch)} Channel/Group links (#{new_ch[0]['n']}–#{new_ch[-1]['n']})",
+            caption=(
+                f"✅ {len(working_sent)} Working Channel/Group links "
+                f"(#{working_sent[0]['n']}–#{working_sent[-1]['n']})"
+            ),
         )
 
-    if new_al:
-        f = io.BytesIO(make_txt_report(new_al))
+    if addlist_sent:
+        f = io.BytesIO(make_txt_report(addlist_sent, include_info=False))
         f.name = "addlist_links.txt"
         await bot.send_file(
             chat_id, f,
-            caption=f"📁 {len(new_al)} Addlist/Folder links (#{new_al[0]['n']}–#{new_al[-1]['n']})",
+            caption=(
+                f"📁 {len(addlist_sent)} Addlist/Folder links "
+                f"(#{addlist_sent[0]['n']}–#{addlist_sent[-1]['n']})"
+            ),
         )
 
 
