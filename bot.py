@@ -143,7 +143,18 @@ def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = 
     ):
         return "Channel is not available / inaccessible"
 
-    # 2. Generic "can't be displayed" notices
+    # 2. Generic "can't be displayed" notices (ignore 18+ sensitive/adult content notices)
+    if any(
+        phrase in norm
+        for phrase in (
+            "spread pornographic content",
+            "sensitive content",
+            "suitable only for adults",
+            "always show 18+ media",
+        )
+    ):
+        return ""
+
     if any(
         phrase in norm
         for phrase in (
@@ -153,10 +164,6 @@ def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = 
             "cannot be displayed",
         )
     ):
-        # On public ?embed=1 widgets, Telegram shows a web-only NSFW preview notice for live adult channels.
-        # Only skip that notice when allow_web_porn_notice=True and no hard ban phrase matched above.
-        if allow_web_porn_notice and "spread pornographic content" in norm:
-            return ""
         return "Not available: Channel can't be displayed (Banned/Restricted)"
 
     return ""
@@ -165,7 +172,7 @@ def _detect_telegram_ban_reason(raw_html: str, *, allow_web_porn_notice: bool = 
 async def check_channel_link_alive(link: str) -> tuple[bool, str]:
     """
     Check if a Telegram channel link is active and valid (exact /checklinks logic
-    from Channel link provider).
+    from Channel link provider, treating 18+ sensitive-content gated channels as ACTIVE).
     Detects expired/revoked links, deleted channels, and Terms of Service bans.
     Returns (is_alive: bool, detail_or_reason: str).
     """
@@ -206,18 +213,53 @@ async def check_channel_link_alive(link: str) -> tuple[bool, str]:
             public_slug = first_seg.lstrip("@")
             clean_link = f"https://t.me/{public_slug}"
 
-    # For public channels, check Telegram's ?embed=1 widget endpoint FIRST because it explicitly
-    # returns "This channel can't be displayed because it violated Telegram's Terms of Service."
+    # For public channels, check Telegram's ?embed=1 widget endpoint FIRST:
+    # - Explicitly detects Terms of Service / copyright bans.
+    # - Detects active 18+ sensitive content channels (whose main t.me page hides tgme_page_title)
+    #   and active channels even when t.me main page rate-limits username lookups.
     embed_ban_reason = ""
+    embed_confirmed_alive = False
+    embed_title = ""
     if public_slug:
         try:
             emb_resp = await _ASYNC_HTTP_CLIENT.get(f"https://t.me/{public_slug}/1?embed=1")
             if emb_resp.status_code == 200:
+                emb_text = emb_resp.text
                 embed_ban_reason = _detect_telegram_ban_reason(
-                    emb_resp.text, allow_web_porn_notice=True
+                    emb_text, allow_web_porn_notice=True
                 )
                 if embed_ban_reason:
                     return False, embed_ban_reason
+
+                m_owner = re.search(
+                    r'class=["\']tgme_widget_message_owner_name["\'][^>]*>(.*?)</a>',
+                    emb_text,
+                    re.S,
+                )
+                if m_owner:
+                    embed_title = html.unescape(re.sub(r"<[^>]+>", "", m_owner.group(1)).strip())
+                    embed_confirmed_alive = True
+
+                m_err = re.search(
+                    r'class=["\']tgme_widget_message_error["\'][^>]*>(.*?)</div>',
+                    emb_text,
+                    re.S,
+                )
+                if m_err is not None:
+                    err_txt = html.unescape(re.sub(r"<[^>]+>", "", m_err.group(1)).strip())
+                    low_err = err_txt.lower()
+                    if "not found" in low_err and "post not found" not in low_err:
+                        return False, f"Channel @{public_slug} not found"
+                    if (
+                        err_txt == ""
+                        or "spread pornographic content" in low_err
+                        or "sensitive content" in low_err
+                        or "suitable only for adults" in low_err
+                        or "post not found" in low_err
+                    ):
+                        embed_confirmed_alive = True
+                        if not embed_title:
+                            embed_title = f"18+ Sensitive Content (@{public_slug})" if err_txt != "Post not found" else f"@{public_slug}"
         except Exception as exc:  # noqa: BLE001
             log.debug("[LINK CHECK] Embed check skipped for @%s: %s", public_slug, exc)
 
@@ -229,12 +271,16 @@ async def check_channel_link_alive(link: str) -> tuple[bool, str]:
                 if attempt == 0:
                     await asyncio.sleep(1.5)
                     continue
+                if embed_confirmed_alive:
+                    return True, embed_title or f"Active (@{public_slug})"
                 return False, f"Telegram rate limit / server busy (HTTP {resp.status_code})"
 
             if resp.status_code == 404:
                 return False, "Link not found (HTTP 404)"
 
             if resp.status_code != 200:
+                if embed_confirmed_alive:
+                    return True, embed_title or f"Active (@{public_slug})"
                 return False, f"Unexpected HTTP status {resp.status_code}"
 
             # If Telegram redirected an invalid username link away from t.me to telegram.org homepage
@@ -245,7 +291,7 @@ async def check_channel_link_alive(link: str) -> tuple[bool, str]:
             text = resp.text
 
             # Check for Terms of Service ban, copyright/law blocks, and unavailable notices
-            ban_reason = _detect_telegram_ban_reason(text, allow_web_porn_notice=False)
+            ban_reason = _detect_telegram_ban_reason(text, allow_web_porn_notice=True)
             if ban_reason:
                 return False, ban_reason
 
@@ -283,6 +329,25 @@ async def check_channel_link_alive(link: str) -> tuple[bool, str]:
                 if title_str:
                     return True, title_str
                 return True, f"Active ({extra_str})"
+
+            # 18+ sensitive content channels hide tgme_page_title on t.me web preview
+            # (showing "Telegram: View @..." / "Preview channel" or confirmed via ?embed=1)
+            low_text = text.lower()
+            if (
+                embed_confirmed_alive
+                or "tgme_page_context_link" in low_text
+                or (public_slug and f"<title>telegram: view @{public_slug.lower()}</title>" in low_text)
+                or any(
+                    p in low_text
+                    for p in (
+                        "sensitive content",
+                        "suitable only for adults",
+                        "always show 18+ media",
+                        "spread pornographic content",
+                    )
+                )
+            ):
+                return True, embed_title or f"18+ Sensitive Content (@{public_slug or clean_link})"
 
             if is_invite:
                 return False, "Invite link is expired, banned, or invalid"
@@ -1240,13 +1305,18 @@ async def validate_and_deliver_links(
             continue
 
         cached = cache.get(link.key)
-        if cached and not fresh and (time.time() - cached.get("ts", 0) < CACHE_HOURS * 3600):
+        if (
+            cached
+            and cached.get("v") == 2
+            and not fresh
+            and (time.time() - cached.get("ts", 0) < CACHE_HOURS * 3600)
+        ):
             is_alive, detail = bool(cached.get("ok")), str(cached.get("info") or "")
         else:
             if idx > 1:
                 await asyncio.sleep(CHECK_DELAY)
             is_alive, detail = await check_channel_link_alive(link.url)
-            cache[link.key] = {"ok": is_alive, "info": detail, "ts": time.time()}
+            cache[link.key] = {"v": 2, "ok": is_alive, "info": detail, "ts": time.time()}
             if idx % 20 == 0:
                 save_cache(cache)
 
