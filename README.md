@@ -28,7 +28,6 @@ every link using the `/checklinks` logic from **Channel link provider**, sends
 | `/scan` | Scan whole channel, validate links & return working links + all addlists |
 | `/scan 500` | Scan only the latest 500 messages |
 | `/scan fresh` | Ignore cached link checks and re-validate every link |
-| `/checklinks` | Paste or forward any links to validate and get working links + addlists |
 | `/progress` | Show completed vs pending counts and next link |
 | `/pending` | Resend uncompleted links |
 | `/done 25` | Mark Working Channel links `1–25` completed (`/done addlist 10` for Addlist links) |

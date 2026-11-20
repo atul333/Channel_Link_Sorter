@@ -14,7 +14,6 @@ Channel Link Sorter Bot
 * Deduplicates links and never repeats links already sent to the admin.
 * Numbers every link (1., 2., 3.…) separated into 5-by-5 blocks, with a
   separate interactive checklist button for each 5-link block (1–5, 6–10, …).
-* Also supports `/checklinks` to validate any pasted/forwarded links on demand.
 """
 
 import asyncio
@@ -681,8 +680,7 @@ HELP = (
     "<b>Scan & Validate</b>\n"
     "/scan – scan whole channel, validate links & send working links + all addlists\n"
     "/scan 500 – scan only the latest 500 messages\n"
-    "/scan fresh – ignore cached link checks and re-validate every link\n"
-    "/checklinks – paste or forward any links to validate and get working links only\n\n"
+    "/scan fresh – ignore cached link checks and re-validate every link\n\n"
     "<b>Progress & History</b>\n"
     "/progress – check completed vs pending counts\n"
     "/pending – resend uncompleted links\n"
@@ -771,7 +769,6 @@ async def main():
     scan_lock = asyncio.Lock()
     cancel_event = asyncio.Event()
     login_state: dict[int, dict] = {}       # chat_id -> {"step", "phone", "hash"}
-    checklinks_wait: set[int] = set()       # chat_ids waiting for /checklinks input
 
     def is_owner(event) -> bool:
         return owner["id"] == 0 or event.sender_id == owner["id"]
@@ -798,7 +795,6 @@ async def main():
             return await event.reply("Use /login in a private chat with me.")
         if not is_owner(event):
             return await deny(event)
-        checklinks_wait.discard(event.chat_id)
         user = clients["user"]
         if await is_authorized_safe(user):
             me = await user.get_me()
@@ -999,7 +995,6 @@ async def main():
     async def on_cancel(event):
         if not is_owner(event):
             return
-        checklinks_wait.discard(event.chat_id)
         if login_state.pop(event.chat_id, None):
             await event.reply("Login cancelled.")
         elif scan_lock.locked():
@@ -1113,68 +1108,7 @@ async def main():
         if not any_pending:
             await event.reply("🎉 Nothing pending – all links are marked completed!")
 
-    # ---------------- /checklinks (interactive link validator) ------------- #
-    @bot.on(events.NewMessage(pattern=r"^/(?:checklinks|monitor)(?:@\w+)?(.*)$", func=lambda e: bool(re.match(r"^/(?:checklinks|monitor)", e.raw_text or "", re.I))))
-    async def on_checklinks(event):
-        if not is_owner(event):
-            return await deny(event)
-        if scan_lock.locked():
-            return await event.reply("⏳ A scan is already running. Use /cancel to stop it.")
-
-        raw_links = extract_raw_links(event.message)
-        # Remove the command itself if matched
-        links_map: dict[str, Link] = {}
-        for raw in raw_links:
-            l = parse_link(raw)
-            if l and l.key not in links_map:
-                links_map[l.key] = l
-
-        if not links_map:
-            checklinks_wait.add(event.chat_id)
-            return await event.reply(
-                "🔍 <b>Check Channel Links</b>\n\n"
-                "Send or forward the Telegram links you want to validate.\n"
-                "✅ I will validate them using the <code>/checklinks</code> logic and return:\n"
-                "• <b>Working Channel/Group links only</b> (in 5-by-5 numbered blocks + checklist)\n"
-                "• <b>All <code>https://t.me/addlist/</code> links</b> separately\n\n"
-                "Type /cancel to abort."
-            )
-
-        checklinks_wait.discard(event.chat_id)
-        async with scan_lock:
-            cancel_event.clear()
-            status = await event.reply(f"🔍 Validating {len(links_map)} link(s)…")
-            await validate_and_deliver_links(
-                bot, event.chat_id, "Direct /checklinks", 1,
-                list(links_map.values()), 0, False, Progress(status), cancel_event,
-            )
-
-    @bot.on(events.NewMessage(
-        func=lambda e: e.is_private and e.chat_id in checklinks_wait
-        and e.chat_id not in login_state and not (e.raw_text or "").startswith("/")
-    ))
-    async def on_checklinks_input(event):
-        if not is_owner(event):
-            return
-        links_map: dict[str, Link] = {}
-        for raw in extract_raw_links(event.message):
-            l = parse_link(raw)
-            if l and l.key not in links_map:
-                links_map[l.key] = l
-        if not links_map:
-            return await event.reply(
-                "⚠️ No valid Telegram links found in your message. Send links or /cancel."
-            )
-        checklinks_wait.discard(event.chat_id)
-        async with scan_lock:
-            cancel_event.clear()
-            status = await event.reply(f"🔍 Validating {len(links_map)} link(s)…")
-            await validate_and_deliver_links(
-                bot, event.chat_id, "Direct /checklinks", 1,
-                list(links_map.values()), 0, False, Progress(status), cancel_event,
-            )
-
-    # ---------------- /scan ---------------- #
+    # ---------------- /scan (extracts + validates via /checklinks logic) --- #
     @bot.on(events.NewMessage(pattern=r"^/scan(?:@\w+)?(.*)$"))
     async def on_scan(event):
         if not is_owner(event):
